@@ -7,12 +7,26 @@ use std::time::Instant;
 use futures::future::BoxFuture;
 use rand::seq::index::sample;
 
-use crate::policies::admission::{compare_decode_pressure, compare_prefill_pressure};
-use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
+use crate::state::load_monitor::engine_reported_load::{
+    EngineReportedLoadSnapshot, EngineReportedLoadTable,
+};
 use crate::workers::Worker;
 
 use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};
+use super::scoring::{decode_score, load_source, prefill_score, EngineScore, LoadSource};
 use super::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
+
+fn engine_pressure_score(
+    engine: &Worker,
+    load: &EngineReportedLoadSnapshot,
+    stage: Stage,
+    source: LoadSource,
+) -> EngineScore {
+    match stage {
+        Stage::Plain | Stage::Prefill => prefill_score(engine, load, source),
+        Stage::Decode => decode_score(engine, load, source),
+    }
+}
 
 /// Samples up to N distinct engines and selects by stage pressure. Defaults to 2.
 /// Checks admission only on the selected engine; rejection never resamples.
@@ -61,22 +75,11 @@ impl Policy for PowerOfNPolicy {
                 engines.len(),
                 self.choices.min(engines.len()),
             );
+            let source = load_source(&load, candidates.iter().map(|i| &engines[i]));
             let engine = candidates
                 .iter()
                 .map(|i| &engines[i])
-                .reduce(|left, right| {
-                    let pressure = match request.stage {
-                        Stage::Plain | Stage::Prefill => {
-                            compare_prefill_pressure(left, right, Some(&load))
-                        }
-                        Stage::Decode => compare_decode_pressure(left, right, Some(&load)),
-                    };
-                    if pressure.is_gt() {
-                        right
-                    } else {
-                        left
-                    }
-                })
+                .min_by_key(|engine| engine_pressure_score(engine, &load, request.stage, source))
                 .expect("nonempty candidate sample");
             let metrics = EngineMetrics::observe(engine, &load);
             if let Decision::Reject(reason) = self.admission.check(engine, &metrics)? {

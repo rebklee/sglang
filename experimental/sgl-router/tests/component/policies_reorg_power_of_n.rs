@@ -107,12 +107,60 @@ async fn prefill_uses_estimated_queue_time_only_when_both_engines_have_rates() {
 }
 
 #[tokio::test]
+async fn mixed_queue_time_estimates_use_tokens_for_the_whole_sample() {
+    let engines = [
+        engine("a", Stage::Prefill, 0),
+        engine("b", Stage::Prefill, 0),
+        engine("c", Stage::Prefill, 0),
+    ];
+    let table = EngineReportedLoadTable::new();
+    for (i, (pending, rate)) in [(10, Some(100)), (30, Some(3000)), (20, None)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut report = load(1, 1, 10, 100, pending);
+        if let Some(rate) = rate {
+            table.set(&engines[i].url, 0, report.clone(), Instant::now());
+            let native = report.native_cache.as_mut().unwrap();
+            native.total_prefill_uncached_tokens = rate;
+            native.total_prefill_busy_us = 1_000_000;
+        }
+        table.set(&engines[i].url, 0, report, Instant::now());
+    }
+    // Pairwise source switching cycles: B beats A by time, A beats C by
+    // tokens, and C beats B by tokens. The whole sample must use tokens.
+    let policy = PowerOfNPolicy::new(table).with_choices(3).unwrap();
+    assert_winner(&policy, &engines, Stage::Prefill, &engines[0]).await;
+}
+
+#[tokio::test]
+async fn one_missing_report_uses_local_counts_for_the_whole_sample() {
+    for stage in [Stage::Plain, Stage::Prefill, Stage::Decode] {
+        let engines = [
+            engine("a", stage, 1),
+            engine("b", stage, 2),
+            engine("c", stage, 3),
+        ];
+        let table = EngineReportedLoadTable::new();
+        table.set(&engines[0].url, 0, load(9, 9, 90, 100, 90), Instant::now());
+        table.set(&engines[1].url, 0, load(0, 0, 0, 100, 0), Instant::now());
+        let policy = PowerOfNPolicy::new(table).with_choices(3).unwrap();
+        assert_winner(&policy, &engines, stage, &engines[0]).await;
+    }
+}
+
+#[tokio::test]
 async fn decode_orders_by_waiting_running_kv_fraction_then_tokens() {
     let cases = [
         (load(50, 1, 90, 100, 0), load(1, 2, 1, 100, 0)),
         (load(1, 1, 90, 100, 0), load(2, 1, 1, 100, 0)),
         (load(1, 1, 100, 1000, 0), load(1, 1, 20, 100, 0)),
         (load(1, 1, 10, 100, 0), load(1, 1, 100, 1000, 0)),
+        // These fractions round to the same f64; preserve exact ordering.
+        (
+            load(1, 1, u64::MAX - 1, u64::MAX, 0),
+            load(1, 1, u64::MAX - 1, u64::MAX - 1, 0),
+        ),
     ];
     for (left, right) in cases {
         let engines = [
